@@ -42,33 +42,33 @@ TheySynced uses a clean 2-tier architecture: a Rust Axum engine handling all bus
 
 ```mermaid
 graph TB
-    subgraph Client["🌐 Client Layer"]
-        Browser["Browser / PWA"]
-        Mobile["Mobile (iOS/Android)"]
+    subgraph Client["Client Layer"]
+        Browser["Browser and PWA"]
+        Mobile["Mobile iOS and Android"]
     end
 
-    subgraph Frontend["⚡ Next.js 16 — Port 3000"]
-        AppRouter["App Router (SSR/SSG)"]
-        SPA["React SPA (src_frontend/)"]
+    subgraph Frontend["Next.js 16 — Port 3000"]
+        AppRouter["App Router SSR and SSG"]
+        SPA["React SPA"]
         Landing["Landing Page"]
-        CompanySite["Public Company Sites (/c/[id])"]
-        PWA["PWA Manifest + Service Worker"]
+        CompanySite["Public Company Sites"]
+        PWA["PWA Manifest"]
     end
 
-    subgraph Backend["🦀 Rust Axum Engine — Port 8000"]
-        REST["REST API (/api/*)"]
-        WS["WebSocket Hub (/ws/*)"]
-        Auth["Auth (Argon2id + JWT)"]
+    subgraph Backend["Rust Axum Engine — Port 8000"]
+        REST["REST API — /api"]
+        WS["WebSocket Hub — /ws"]
+        Auth["Auth — Argon2id and JWT"]
         Cache["Moka In-Memory Cache"]
         Search["Tantivy Search Index"]
-        DB["JSON Database (theysynced_db.json)"]
-        OpenAPI["OpenAPI / Swagger UI (/swagger-ui)"]
+        DB["JSON Database"]
+        OpenAPI["OpenAPI and Swagger UI"]
     end
 
-    Browser -->|HTTP / WS| Frontend
-    Mobile -->|HTTP / WS| Frontend
+    Browser -->|HTTP and WS| Frontend
+    Mobile -->|HTTP and WS| Frontend
     AppRouter -->|Proxy API calls| Backend
-    SPA -->|fetch() + WebSocket| Backend
+    SPA -->|fetch and WebSocket| Backend
     REST --> Auth
     REST --> Cache
     REST --> DB
@@ -111,27 +111,27 @@ sequenceDiagram
 
 ```mermaid
 graph LR
-    subgraph RustModules["Rust Modules (src/)"]
-        main["main.rs\nAxum router, handlers,\nWebSocket engine"]
-        database["database.rs\nAll DB structs, CRUD,\nJSON persistence"]
-        session["session.rs\nJWT session management"]
-        openapi["openapi.rs\nUtoipa OpenAPI schema"]
+    subgraph RustModules["Rust Modules — src/"]
+        main["main.rs — Axum router, handlers, WebSocket engine"]
+        database["database.rs — DB structs, CRUD, JSON persistence"]
+        session["session.rs — JWT session management"]
+        openapi["openapi.rs — Utoipa OpenAPI schema"]
     end
 
-    subgraph FrontendModules["Frontend Modules (src_frontend/)"]
-        App["App.tsx\nMain SPA shell + tab routing"]
-        types["types.ts\nShared TypeScript interfaces"]
-        components["components/\n20 React components"]
+    subgraph FrontendModules["Frontend Modules — src_frontend/"]
+        App["App.tsx — Main SPA shell and tab routing"]
+        types["types.ts — Shared TypeScript interfaces"]
+        components["components/ — 20 React components"]
     end
 
-    subgraph NextApp["Next.js App (app/)"]
-        layout["layout.tsx\nRoot layout + metadata"]
-        page["page.tsx\nApp entry point"]
-        c["c/[id]/\nPublic company microsites"]
-        invite["invite/\nInvite link handler"]
-        sitemap["sitemap.ts\nDynamic XML sitemap"]
-        robots["robots.ts\nSEO robots rules"]
-        manifest["manifest.ts\nPWA manifest"]
+    subgraph NextApp["Next.js App — app/"]
+        layout["layout.tsx — Root layout and metadata"]
+        page["page.tsx — App entry point"]
+        cpage["c/id/ — Public company microsites"]
+        invite["invite/ — Invite link handler"]
+        sitemap["sitemap.ts — Dynamic XML sitemap"]
+        robots["robots.ts — SEO robots rules"]
+        manifest["manifest.ts — PWA manifest"]
     end
 
     main --> database
@@ -148,45 +148,45 @@ graph LR
 ```mermaid
 graph TD
     subgraph Roles["Role Hierarchy"]
-        Owner["👑 Owner\n(full control, cannot be removed)"]
-        Admin["🔑 Admin\n(manage members, settings)"]
-        Moderator["🛡 Moderator\n(manage channels, messages)"]
-        Member["👤 Member\n(read/write workspace)"]
-        Guest["👁 Guest\n(read-only)"]
+        Owner["Owner — full control"]
+        Admin["Admin — manage members and settings"]
+        Moderator["Moderator — manage channels and messages"]
+        Member["Member — read and write workspace"]
+        Guest["Guest — read only"]
     end
 
     subgraph Access["Access Patterns"]
-        Public["🌐 Public Company\n(/c/[company_id] visible to all)"]
-        Private["🔒 Private Company\n(invite-only via OTP or link)"]
-        OTP["6-digit OTP\n(15-min expiry, admin-generated)"]
-        InviteLink["Shareable Invite Link\n(/invite?code=...)"]
+        PublicCo["Public Company — visible to anyone"]
+        PrivateCo["Private Company — invite only"]
+        OTP["6-digit OTP — 15 min expiry, admin generated"]
+        InviteLink["Shareable Invite Link"]
     end
 
     Owner --> Admin --> Moderator --> Member --> Guest
-    Private -->|Join via| OTP
-    Private -->|Join via| InviteLink
-    Public -->|Visible at| Public
+    PrivateCo -->|Join via| OTP
+    PrivateCo -->|Join via| InviteLink
+    PublicCo -->|Public microsite at c/id| PublicCo
 ```
 
 ### WebSocket Room Architecture
 
 ```mermaid
 graph LR
-    subgraph WSHub["WebSocket Hub (DashMap)"]
-        Room1["room: comp_abc123\n[conn1, conn2, conn3]"]
-        Room2["room: comp_def456\n[conn4, conn5]"]
+    subgraph WSHub["WebSocket Hub — DashMap"]
+        Room1["room: comp_abc123 — conn1, conn2, conn3"]
+        Room2["room: comp_def456 — conn4, conn5"]
     end
 
     subgraph MessageTypes["WebSocket Message Types"]
-        Whiteboard["whiteboard_update\n(Excalidraw element deltas)"]
-        Chat["chat_message\n(channel + DM messages)"]
-        Presence["user_presence\n(online/offline/typing)"]
-        Video["webrtc_signal\n(SDP offer/answer/ICE)"]
+        Whiteboard["whiteboard_update — Excalidraw deltas"]
+        Chat["chat_message — channel and DM messages"]
+        Presence["user_presence — online, offline, typing"]
+        Video["webrtc_signal — SDP offer, answer, ICE"]
     end
 
-    Client1["Client A"] -->|ws connect| Room1
-    Client2["Client B"] -->|ws connect| Room1
-    Client3["Client C"] -->|ws connect| Room2
+    ClientA["Client A"] -->|ws connect| Room1
+    ClientB["Client B"] -->|ws connect| Room1
+    ClientC["Client C"] -->|ws connect| Room2
     Room1 -->|broadcast| Whiteboard
     Room1 -->|broadcast| Chat
     Room1 -->|broadcast| Presence
