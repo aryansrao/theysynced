@@ -87,3 +87,4 @@ brain/
 
 # ─── Docker (keep Dockerfile/compose, ignore generated volumes) ───────────────
 # Dockerfile and docker-compose.yml are committed
+.vercel
