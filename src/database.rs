@@ -5,6 +5,7 @@ use argon2::{
 };
 use dashmap::DashMap;
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use libsql::{Builder, Connection};
 use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -152,25 +153,6 @@ pub struct WorkspaceAsset {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum LegacyOrNewPasskeys {
-    Legacy(String),
-    New(Vec<EnrolledPasskey>),
-}
-
-#[derive(Debug, Serialize, Deserialize, Default)]
-pub struct PersistentState {
-    pub users: Vec<(String, UserProfile)>,
-    pub companies: Vec<(String, Company)>,
-    pub teams: Vec<(String, Vec<Team>)>,
-    pub assets: Vec<(String, Vec<WorkspaceAsset>)>,
-    pub messages: Vec<(String, Vec<ChatMessage>)>,
-    pub passkeys: Vec<(String, LegacyOrNewPasskeys)>,
-    #[serde(default)]
-    pub invites: Vec<(String, CompanyInvite)>,
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TokenClaims {
     pub user_id: String,
@@ -199,11 +181,13 @@ pub struct SearchResult {
 
 pub struct Database {
     jwt_secret: String,
+    // Turso (libSQL) remote database connection
+    turso: Arc<Connection>,
     // Moka high-performance async caches with TTL
     pub user_cache: Cache<String, UserProfile>,
     pub company_cache: Cache<String, Company>,
-    
-    // Memory store maps
+
+    // Memory store maps (hot in-memory cache backed by Turso)
     pub users: Arc<DashMap<String, UserProfile>>,
     pub companies: Arc<DashMap<String, Company>>,
     pub teams: Arc<DashMap<String, Vec<Team>>>,
@@ -211,7 +195,6 @@ pub struct Database {
     pub messages: Arc<DashMap<String, Vec<ChatMessage>>>,
     pub passkeys: Arc<DashMap<String, Vec<EnrolledPasskey>>>,
     pub invites: Arc<DashMap<String, CompanyInvite>>,
-
 
     // Tantivy full-text search engine
     pub search_index: Index,
@@ -226,7 +209,21 @@ impl Database {
         let jwt_secret = std::env::var("JWT_SECRET")
             .unwrap_or_else(|_| "theysynced_enterprise_secret_jwt_key_2026".to_string());
 
-        // Initialize Moka high-speed async caches with 1-hour TTL
+        // ── Connect to Turso ─────────────────────────────────────────────────
+        let turso_url = std::env::var("TURSO_DATABASE_URL")
+            .expect("TURSO_DATABASE_URL must be set");
+        let turso_token = std::env::var("TURSO_AUTH_TOKEN")
+            .expect("TURSO_AUTH_TOKEN must be set");
+
+        let db = Builder::new_remote(turso_url, turso_token)
+            .build()
+            .await
+            .map_err(|e| anyhow!("Turso connection failed: {}", e))?;
+        let turso = Arc::new(
+            db.connect().map_err(|e| anyhow!("Turso connect() failed: {}", e))?
+        );
+
+        // ── Moka high-speed async caches with 1-hour TTL ──────────────────────
         let user_cache: Cache<String, UserProfile> = Cache::builder()
             .max_capacity(10_000)
             .time_to_live(Duration::from_secs(3600))
@@ -245,8 +242,7 @@ impl Database {
         let passkeys = Arc::new(DashMap::new());
         let invites = Arc::new(DashMap::new());
 
-
-        // Build Tantivy Search Engine schema
+        // ── Tantivy search engine ─────────────────────────────────────────────
         let mut schema_builder = Schema::builder();
         let schema_title = schema_builder.add_text_field("title", TEXT | STORED);
         let schema_category = schema_builder.add_text_field("category", TEXT | STORED);
@@ -261,6 +257,7 @@ impl Database {
 
         let instance = Self {
             jwt_secret,
+            turso,
             user_cache,
             company_cache,
             users,
@@ -277,70 +274,218 @@ impl Database {
             schema_body,
         };
 
-
-        instance.load_from_disk();
+        instance.init_schema().await?;
+        instance.load_from_turso().await?;
         instance.index_initial_search_data()?;
 
         Ok(instance)
     }
 
-    pub fn persist_to_disk(&self) {
-        let state = PersistentState {
-            users: self.users.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
-            companies: self.companies.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
-            teams: self.teams.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
-            assets: self.assets.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
-            messages: self.messages.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
-            passkeys: self.passkeys.iter().map(|e| (e.key().clone(), LegacyOrNewPasskeys::New(e.value().clone()))).collect(),
-            invites: self.invites.iter().map(|e| (e.key().clone(), e.value().clone())).collect(),
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write("theysynced_db.json", json);
+    // ── Turso Schema Initialization ───────────────────────────────────────────
+    async fn init_schema(&self) -> Result<()> {
+        let ddl = "
+            CREATE TABLE IF NOT EXISTS ts_users     (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ts_companies (id  TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ts_teams     (company_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ts_assets    (company_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ts_messages  (key TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ts_passkeys  (user_id TEXT PRIMARY KEY, data TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS ts_invites   (code TEXT PRIMARY KEY, data TEXT NOT NULL);
+        ";
+        self.turso.execute_batch(ddl).await
+            .map(|_| ())
+            .map_err(|e| anyhow!("Turso schema init failed: {}", e))
+    }
+
+    // ── Load all data from Turso into DashMaps on startup ─────────────────────
+    async fn load_from_turso(&self) -> Result<()> {
+        // users
+        let mut rows = self.turso.query("SELECT key, data FROM ts_users", ()).await
+            .map_err(|e| anyhow!("Turso load users failed: {}", e))?;
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!("{}", e))? {
+            let key: String = row.get(0).map_err(|e| anyhow!("{}", e))?;
+            let data: String = row.get(1).map_err(|e| anyhow!("{}", e))?;
+            if let Ok(v) = serde_json::from_str::<UserProfile>(&data) {
+                self.users.insert(key, v);
+            }
+        }
+
+        // companies
+        let mut rows = self.turso.query("SELECT id, data FROM ts_companies", ()).await
+            .map_err(|e| anyhow!("Turso load companies failed: {}", e))?;
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!("{}", e))? {
+            let key: String = row.get(0).map_err(|e| anyhow!("{}", e))?;
+            let data: String = row.get(1).map_err(|e| anyhow!("{}", e))?;
+            if let Ok(v) = serde_json::from_str::<Company>(&data) {
+                self.companies.insert(key, v);
+            }
+        }
+
+        // teams
+        let mut rows = self.turso.query("SELECT company_id, data FROM ts_teams", ()).await
+            .map_err(|e| anyhow!("Turso load teams failed: {}", e))?;
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!("{}", e))? {
+            let key: String = row.get(0).map_err(|e| anyhow!("{}", e))?;
+            let data: String = row.get(1).map_err(|e| anyhow!("{}", e))?;
+            if let Ok(v) = serde_json::from_str::<Vec<Team>>(&data) {
+                self.teams.insert(key, v);
+            }
+        }
+
+        // assets
+        let mut rows = self.turso.query("SELECT company_id, data FROM ts_assets", ()).await
+            .map_err(|e| anyhow!("Turso load assets failed: {}", e))?;
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!("{}", e))? {
+            let key: String = row.get(0).map_err(|e| anyhow!("{}", e))?;
+            let data: String = row.get(1).map_err(|e| anyhow!("{}", e))?;
+            if let Ok(v) = serde_json::from_str::<Vec<WorkspaceAsset>>(&data) {
+                self.assets.insert(key, v);
+            }
+        }
+
+        // messages
+        let mut rows = self.turso.query("SELECT key, data FROM ts_messages", ()).await
+            .map_err(|e| anyhow!("Turso load messages failed: {}", e))?;
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!("{}", e))? {
+            let key: String = row.get(0).map_err(|e| anyhow!("{}", e))?;
+            let data: String = row.get(1).map_err(|e| anyhow!("{}", e))?;
+            if let Ok(v) = serde_json::from_str::<Vec<ChatMessage>>(&data) {
+                self.messages.insert(key, v);
+            }
+        }
+
+        // passkeys
+        let mut rows = self.turso.query("SELECT user_id, data FROM ts_passkeys", ()).await
+            .map_err(|e| anyhow!("Turso load passkeys failed: {}", e))?;
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!("{}", e))? {
+            let key: String = row.get(0).map_err(|e| anyhow!("{}", e))?;
+            let data: String = row.get(1).map_err(|e| anyhow!("{}", e))?;
+            if let Ok(v) = serde_json::from_str::<Vec<EnrolledPasskey>>(&data) {
+                self.passkeys.insert(key, v);
+            }
+        }
+
+        // invites
+        let mut rows = self.turso.query("SELECT code, data FROM ts_invites", ()).await
+            .map_err(|e| anyhow!("Turso load invites failed: {}", e))?;
+        while let Some(row) = rows.next().await.map_err(|e| anyhow!("{}", e))? {
+            let key: String = row.get(0).map_err(|e| anyhow!("{}", e))?;
+            let data: String = row.get(1).map_err(|e| anyhow!("{}", e))?;
+            if let Ok(v) = serde_json::from_str::<CompanyInvite>(&data) {
+                self.invites.insert(key, v);
+            }
+        }
+
+        tracing::info!("✅ Turso: loaded all data into memory");
+        Ok(())
+    }
+
+    // ── Fine-grained Turso upsert helpers ─────────────────────────────────────
+    async fn upsert_user(&self, key: &str, user: &UserProfile) {
+        if let Ok(data) = serde_json::to_string(user) {
+            let _ = self.turso.execute(
+                "INSERT OR REPLACE INTO ts_users (key, data) VALUES (?1, ?2)",
+                libsql::params![key.to_string(), data],
+            ).await;
         }
     }
 
-    pub fn load_from_disk(&self) {
-        if let Ok(content) = std::fs::read_to_string("theysynced_db.json") {
-            match serde_json::from_str::<PersistentState>(&content) {
-                Ok(state) => {
-                    for (k, v) in state.users {
-                        self.users.insert(k, v);
-                    }
-                    for (k, v) in state.companies {
-                        self.companies.insert(k, v);
-                    }
-                    for (k, v) in state.teams {
-                        self.teams.insert(k, v);
-                    }
-                    for (k, v) in state.assets {
-                        self.assets.insert(k, v);
-                    }
-                    for (k, v) in state.messages {
-                        self.messages.insert(k, v);
-                    }
-                    for (k, v) in state.passkeys {
-                        let list = match v {
-                            LegacyOrNewPasskeys::New(list) => list,
-                            LegacyOrNewPasskeys::Legacy(hash) => {
-                                vec![EnrolledPasskey {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    label: "Legacy Passkey".to_string(),
-                                    hash,
-                                    created_at: chrono::Utc::now().to_rfc3339(),
-                                }]
-                            }
-                        };
-                        self.passkeys.insert(k, list);
-                    }
-                    for (k, v) in state.invites {
-                        self.invites.insert(k, v);
-                    }
-                }
-                Err(e) => {
-                    eprintln!("⚠️ Failed to deserialize theysynced_db.json: {}", e);
-                }
-            }
+    async fn upsert_all_users(&self) {
+        for entry in self.users.iter() {
+            self.upsert_user(entry.key(), entry.value()).await;
         }
+    }
+
+    async fn upsert_company(&self, id: &str, company: &Company) {
+        if let Ok(data) = serde_json::to_string(company) {
+            let _ = self.turso.execute(
+                "INSERT OR REPLACE INTO ts_companies (id, data) VALUES (?1, ?2)",
+                libsql::params![id.to_string(), data],
+            ).await;
+        }
+    }
+
+    async fn delete_company_from_turso(&self, id: &str) {
+        let _ = self.turso.execute(
+            "DELETE FROM ts_companies WHERE id = ?1",
+            libsql::params![id.to_string()],
+        ).await;
+    }
+
+    async fn upsert_teams(&self, company_id: &str, teams: &[Team]) {
+        if let Ok(data) = serde_json::to_string(teams) {
+            let _ = self.turso.execute(
+                "INSERT OR REPLACE INTO ts_teams (company_id, data) VALUES (?1, ?2)",
+                libsql::params![company_id.to_string(), data],
+            ).await;
+        }
+    }
+
+    async fn delete_teams_from_turso(&self, company_id: &str) {
+        let _ = self.turso.execute(
+            "DELETE FROM ts_teams WHERE company_id = ?1",
+            libsql::params![company_id.to_string()],
+        ).await;
+    }
+
+    async fn upsert_assets(&self, company_id: &str, assets: &[WorkspaceAsset]) {
+        if let Ok(data) = serde_json::to_string(assets) {
+            let _ = self.turso.execute(
+                "INSERT OR REPLACE INTO ts_assets (company_id, data) VALUES (?1, ?2)",
+                libsql::params![company_id.to_string(), data],
+            ).await;
+        }
+    }
+
+    async fn delete_assets_from_turso(&self, company_id: &str) {
+        let _ = self.turso.execute(
+            "DELETE FROM ts_assets WHERE company_id = ?1",
+            libsql::params![company_id.to_string()],
+        ).await;
+    }
+
+    async fn upsert_messages(&self, key: &str, messages: &[ChatMessage]) {
+        if let Ok(data) = serde_json::to_string(messages) {
+            let _ = self.turso.execute(
+                "INSERT OR REPLACE INTO ts_messages (key, data) VALUES (?1, ?2)",
+                libsql::params![key.to_string(), data],
+            ).await;
+        }
+    }
+
+    /// Public alias for use in WebSocket handlers in main.rs
+    pub async fn upsert_messages_pub(&self, key: &str, messages: &[ChatMessage]) {
+        self.upsert_messages(key, messages).await;
+    }
+
+    async fn upsert_passkeys(&self, user_id: &str, passkeys: &[EnrolledPasskey]) {
+        if let Ok(data) = serde_json::to_string(passkeys) {
+            let _ = self.turso.execute(
+                "INSERT OR REPLACE INTO ts_passkeys (user_id, data) VALUES (?1, ?2)",
+                libsql::params![user_id.to_string(), data],
+            ).await;
+        } else {
+            let _ = self.turso.execute(
+                "DELETE FROM ts_passkeys WHERE user_id = ?1",
+                libsql::params![user_id.to_string()],
+            ).await;
+        }
+    }
+
+    async fn upsert_invite(&self, code: &str, invite: &CompanyInvite) {
+        if let Ok(data) = serde_json::to_string(invite) {
+            let _ = self.turso.execute(
+                "INSERT OR REPLACE INTO ts_invites (code, data) VALUES (?1, ?2)",
+                libsql::params![code.to_string(), data],
+            ).await;
+        }
+    }
+
+    async fn delete_invite_from_turso(&self, code: &str) {
+        let _ = self.turso.execute(
+            "DELETE FROM ts_invites WHERE code = ?1",
+            libsql::params![code.to_string()],
+        ).await;
     }
 
 
@@ -475,7 +620,7 @@ impl Database {
 
         self.users.insert(username_clean.clone(), profile.clone());
         self.user_cache.insert(username_clean.clone(), profile.clone()).await;
-        self.persist_to_disk();
+        self.upsert_user(&username_clean, &profile).await;
 
         let token = self.generate_token(&profile.id, &profile.username)?;
         Ok((token, profile))
@@ -527,8 +672,14 @@ impl Database {
         }
 
         self.users.insert(key.clone(), profile.clone());
-        self.user_cache.insert(key, profile.clone()).await;
-        self.persist_to_disk();
+        self.user_cache.insert(key.clone(), profile.clone()).await;
+        self.upsert_user(&key, &profile).await;
+        // propagate company member changes
+        for entry in self.companies.iter() {
+            if entry.value().member_ids.contains(&profile.id) {
+                self.upsert_company(entry.key(), entry.value()).await;
+            }
+        }
         Ok(profile)
     }
 
@@ -753,7 +904,14 @@ impl Database {
             }
         }
 
-        self.persist_to_disk();
+        // Persist company, its default teams, and the owner's user profile
+        self.upsert_company(&company_id, &company).await;
+        if let Some(t) = self.teams.get(&company_id) {
+            self.upsert_teams(&company_id, &t).await;
+        }
+        if let Some(entry) = self.users.iter().find(|e| e.value().id == owner_id) {
+            self.upsert_user(entry.key(), entry.value()).await;
+        }
         Ok(self.enrich_company(company))
     }
 
@@ -893,7 +1051,7 @@ impl Database {
         };
 
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
-        self.persist_to_disk();
+        self.upsert_company(company_id, &updated_comp).await;
         Ok(self.enrich_company(updated_comp))
     }
 
@@ -930,7 +1088,11 @@ impl Database {
         }
 
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
-        self.persist_to_disk();
+        self.upsert_company(company_id, &updated_comp).await;
+        // persist affected user
+        if let Some(entry) = self.users.iter().find(|e| e.value().id == target_user_id) {
+            self.upsert_user(entry.key(), entry.value()).await;
+        }
         Ok(self.enrich_company(updated_comp))
     }
 
@@ -966,7 +1128,10 @@ impl Database {
         }
 
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
-        self.persist_to_disk();
+        self.upsert_company(company_id, &updated_comp).await;
+        if let Some(entry) = self.users.iter().find(|e| e.value().id == target_user_id) {
+            self.upsert_user(entry.key(), entry.value()).await;
+        }
         Ok(self.enrich_company(updated_comp))
     }
 
@@ -1016,7 +1181,7 @@ impl Database {
         };
 
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
-        self.persist_to_disk();
+        self.upsert_company(company_id, &updated_comp).await;
         Ok(self.enrich_company(updated_comp))
     }
 
@@ -1040,7 +1205,7 @@ impl Database {
         };
 
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
-        self.persist_to_disk();
+        self.upsert_company(company_id, &updated_comp).await;
         Ok(self.enrich_company(updated_comp))
     }
 
@@ -1060,7 +1225,7 @@ impl Database {
         };
 
         self.company_cache.insert(company_id.to_string(), updated_comp.clone()).await;
-        self.persist_to_disk();
+        self.upsert_company(company_id, &updated_comp).await;
         Ok(self.enrich_company(updated_comp))
     }
 
@@ -1085,7 +1250,12 @@ impl Database {
             }
         }
 
-        self.persist_to_disk();
+        // Delete company + its assets and teams from Turso
+        self.delete_company_from_turso(company_id).await;
+        self.delete_teams_from_turso(company_id).await;
+        self.delete_assets_from_turso(company_id).await;
+        // Persist all users (company_ids updated)
+        self.upsert_all_users().await;
         Ok(())
     }
 
@@ -1142,7 +1312,9 @@ impl Database {
             self.teams.insert(company_id.to_string(), vec![team.clone()]);
         }
 
-        self.persist_to_disk();
+        if let Some(t) = self.teams.get(company_id) {
+            self.upsert_teams(company_id, &t).await;
+        }
         Ok(team)
     }
 
@@ -1154,7 +1326,9 @@ impl Database {
         if let Some(mut list) = self.teams.get_mut(company_id) {
             list.retain(|t| t.id != team_id);
         }
-        self.persist_to_disk();
+        if let Some(t) = self.teams.get(company_id) {
+            self.upsert_teams(company_id, &t).await;
+        }
         Ok(())
     }
 
@@ -1194,7 +1368,7 @@ impl Database {
         };
 
         self.invites.insert(code.clone(), invite.clone());
-        self.persist_to_disk();
+        self.upsert_invite(&code, &invite).await;
         Ok(invite)
     }
 
@@ -1218,7 +1392,7 @@ impl Database {
         }
 
         self.invites.remove(code);
-        self.persist_to_disk();
+        self.delete_invite_from_turso(code).await;
         Ok(())
     }
 
@@ -1294,7 +1468,16 @@ impl Database {
             }
         }
 
-        self.persist_to_disk();
+        // Persist company + updated user
+        if let Some(comp) = self.companies.get(&company_id) {
+            self.upsert_company(&company_id, &comp).await;
+        }
+        if let Some(inv) = self.invites.get(code) {
+            self.upsert_invite(code, &inv).await;
+        }
+        if let Some(entry) = self.users.iter().find(|e| e.value().id == user_id) {
+            self.upsert_user(entry.key(), entry.value()).await;
+        }
         if let Some(comp) = self.companies.get(&company_id) {
             Ok(self.enrich_company(comp.clone()))
         } else {
@@ -1326,7 +1509,9 @@ impl Database {
             let _ = writer.commit();
         }
 
-        self.persist_to_disk();
+        if let Some(a) = self.assets.get(company_id) {
+            self.upsert_assets(company_id, &a).await;
+        }
         Ok(asset)
     }
 
@@ -1348,7 +1533,10 @@ impl Database {
             let _ = writer.commit();
         }
 
-        self.persist_to_disk();
+        let key = channel_or_company_id.to_string();
+        if let Some(m) = self.messages.get(&key) {
+            self.upsert_messages(&key, &m).await;
+        }
         Ok(msg)
     }
 
@@ -1387,7 +1575,13 @@ impl Database {
             }
         }
 
-        self.persist_to_disk();
+        if let Some(list) = self.passkeys.get(user_id) {
+            self.upsert_passkeys(user_id, &list).await;
+        }
+        // also persist user (has_passkey flag updated)
+        if let Some(entry) = self.users.iter().find(|e| e.value().id == user_id) {
+            self.upsert_user(entry.key(), entry.value()).await;
+        }
         Ok(())
     }
 
@@ -1426,7 +1620,12 @@ impl Database {
             }
         }
         
-        self.persist_to_disk();
+        // Persist passkeys (or delete row if empty)
+        let passkey_list = self.passkeys.get(user_id).map(|p| p.value().clone()).unwrap_or_default();
+        self.upsert_passkeys(user_id, &passkey_list).await;
+        if let Some(entry) = self.users.iter().find(|e| e.value().id == user_id) {
+            self.upsert_user(entry.key(), entry.value()).await;
+        }
         Ok(())
     }
 
@@ -1493,8 +1692,14 @@ impl Database {
         }
 
         self.users.insert(key.clone(), profile.clone());
-        self.user_cache.insert(key, profile.clone()).await;
-        self.persist_to_disk();
+        self.user_cache.insert(key.clone(), profile.clone()).await;
+        self.upsert_user(&key, &profile).await;
+        // propagate activity to company member entries
+        for entry in self.companies.iter() {
+            if entry.value().member_ids.contains(&profile.id) {
+                self.upsert_company(entry.key(), entry.value()).await;
+            }
+        }
         Ok(profile)
     }
 }

@@ -20,7 +20,7 @@ mod database;
 mod session;
 mod openapi;
 
-use database::{Database, SearchQueryReq, WorkspaceAsset, Company, CompanyInvite, CompanyRole};
+use database::{Database, SearchQueryReq, WorkspaceAsset, CompanyRole};
 
 use openapi::ApiDoc;
 use session::{CallParticipant, ChatMessage, FileAttachment, Session, SessionState};
@@ -1179,7 +1179,15 @@ async fn handle_websocket(socket: WebSocket, session_id: String, state: AppState
                                     list[idx].reactions = Some(reactions.clone());
                                     
                                     drop(list);
-                                    db_clone.persist_to_disk();
+                                    // Persist reaction update to Turso
+                                    let channel_id_owned = channel_id.to_string();
+                                    let db_persist = db_clone.clone();
+                                    let msgs_snap = db_persist.messages.get(&channel_id_owned).map(|m| m.value().clone());
+                                    if let Some(msgs_snap) = msgs_snap {
+                                        tokio::spawn(async move {
+                                            db_persist.upsert_messages_pub(&channel_id_owned, &msgs_snap).await;
+                                        });
+                                    }
                                     
                                     {
                                         let mut st = session_clone.state.write().await;
@@ -1216,7 +1224,15 @@ async fn handle_websocket(socket: WebSocket, session_id: String, state: AppState
                                 }
                                 if deleted {
                                     drop(list);
-                                    db_clone.persist_to_disk();
+                                    // Persist deletion to Turso
+                                    let channel_id_owned = channel_id.to_string();
+                                    let db_persist = db_clone.clone();
+                                    let msgs_snap = db_persist.messages.get(&channel_id_owned).map(|m| m.value().clone());
+                                    if let Some(msgs_snap) = msgs_snap {
+                                        tokio::spawn(async move {
+                                            db_persist.upsert_messages_pub(&channel_id_owned, &msgs_snap).await;
+                                        });
+                                    }
 
                                     {
                                         let mut st = session_clone.state.write().await;
