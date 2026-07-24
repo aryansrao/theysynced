@@ -1,7 +1,7 @@
 use axum::{
     extract::{Path, Query, State, WebSocketUpgrade},
     http::{header, Method, StatusCode},
-    response::{Html, IntoResponse, Json},
+    response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
@@ -86,11 +86,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = Router::new()
-        // Front-end SPA routes (serving modern Next.js / static app)
+        // API Info (root)
         .route("/", get(index_handler))
-        .route("/login", get(index_handler))
-        .route("/dashboard", get(index_handler))
-        .route("/workspace", get(index_handler))
 
         // Health & Metrics
         .route("/api/health", get(health_handler))
@@ -197,7 +194,13 @@ async fn cleanup_inactive_sessions(state: &AppState) {
 }
 
 async fn index_handler() -> impl IntoResponse {
-    Html(include_str!("../static/index.html"))
+    axum::Json(serde_json::json!({
+        "service": "TheySynced API",
+        "version": "0.2.0",
+        "status": "running",
+        "docs": "/swagger-ui",
+        "health": "/api/health"
+    }))
 }
 
 // Auth Handlers

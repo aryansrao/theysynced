@@ -1,0 +1,23 @@
+services:
+  # ── Rust Axum Backend ────────────────────────────────────────────────────────
+  - type: web
+    name: theysynced-backend
+    runtime: rust
+    plan: free
+    region: oregon
+    buildCommand: cargo build --release
+    startCommand: ./target/release/theysynced
+    healthCheckPath: /api/health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: HOST
+        value: 0.0.0.0
+      - key: RUST_LOG
+        value: info
+      - key: JWT_SECRET
+        sync: false          # set in Render dashboard
+      - key: TURSO_DATABASE_URL
+        sync: false          # set in Render dashboard
+      - key: TURSO_AUTH_TOKEN
+        sync: false          # set in Render dashboard
